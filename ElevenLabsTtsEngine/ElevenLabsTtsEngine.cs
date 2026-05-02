@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using ElevenLabsTtsEngine.Config;
 using ElevenLabsTtsEngine.Interop;
@@ -19,6 +21,14 @@ namespace ElevenLabsTtsEngine
         private string _voiceId;
         private ElevenLabsConfig _config;
         private static readonly bool EnableTraceLogging = false;
+        private static readonly object WowSplitLock = new object();
+        private static string _lastWowSplitSpeaker;
+        private static DateTimeOffset _lastWowSplitTime;
+        private static bool _lastWowTextEndedWithSplitMarker;
+        private static readonly TimeSpan WowSplitContinuationWindow = TimeSpan.FromSeconds(10);
+        private static readonly Regex WowChatPrefixRegex = new Regex(
+            @"^\s*(?<time>\d{1,2}:\d{2}:\d{2})\s+(?<speaker>\S+)\s+(?<body>.*)$",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
         public int SetObjectToken(ISpObjectToken pToken)
         {
@@ -65,7 +75,13 @@ namespace ElevenLabsTtsEngine
             try
             {
                 var config = _config ?? ConfigManager.LoadOrCreate();
-                var segments = ApplyCharacterLimits(ReadSegments(pTextFragList), config);
+                var segments = ReadSegments(pTextFragList);
+                if (IsWowProcess())
+                {
+                    segments = NormalizeWowSplitText(segments);
+                }
+
+                segments = ApplyCharacterLimits(segments, config);
                 Trace("Speak segments=" + segments.Count);
                 using (var cancellation = new CancellationTokenSource())
                 using (var api = new ElevenLabsApiClient(config.RequestTimeoutSeconds))
@@ -207,6 +223,141 @@ namespace ElevenLabsTtsEngine
             }
 
             return limited;
+        }
+
+        private static IReadOnlyList<SpeechSegment> NormalizeWowSplitText(IReadOnlyList<SpeechSegment> segments)
+        {
+            var normalized = new List<SpeechSegment>();
+
+            foreach (var segment in segments)
+            {
+                if (segment.IsSilence)
+                {
+                    normalized.Add(segment);
+                    continue;
+                }
+
+                var text = NormalizeWowSplitText(segment.Text);
+                if (!string.IsNullOrWhiteSpace(text))
+                {
+                    normalized.Add(SpeechSegment.TextSegment(text));
+                }
+            }
+
+            return normalized;
+        }
+
+        private static string NormalizeWowSplitText(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return text;
+            }
+
+            var parsed = ParseWowChatLine(text);
+            var now = DateTimeOffset.UtcNow;
+
+            lock (WowSplitLock)
+            {
+                if (parsed.IsContinuation &&
+                    _lastWowTextEndedWithSplitMarker &&
+                    string.Equals(parsed.Speaker, _lastWowSplitSpeaker, StringComparison.OrdinalIgnoreCase) &&
+                    now - _lastWowSplitTime <= WowSplitContinuationWindow)
+                {
+                    UpdateWowSplitState(parsed.Speaker, parsed.EndsWithSplitMarker, now);
+                    return CleanSplitText(parsed.BodyWithoutContinuationMarker);
+                }
+
+                var cleaned = CleanSplitText(text);
+                if (parsed.HasChatPrefix)
+                {
+                    UpdateWowSplitState(parsed.Speaker, parsed.EndsWithSplitMarker, now);
+                }
+                else
+                {
+                    UpdateWowSplitState(null, EndsWithSplitMarker(text), now);
+                }
+
+                return cleaned;
+            }
+        }
+
+        private static WowChatLine ParseWowChatLine(string text)
+        {
+            var result = new WowChatLine
+            {
+                BodyWithoutContinuationMarker = text,
+                EndsWithSplitMarker = EndsWithSplitMarker(text)
+            };
+
+            var match = WowChatPrefixRegex.Match(text);
+            if (!match.Success)
+            {
+                return result;
+            }
+
+            var body = match.Groups["body"].Value;
+            result.HasChatPrefix = true;
+            result.Speaker = match.Groups["speaker"].Value;
+            result.EndsWithSplitMarker = EndsWithSplitMarker(body);
+
+            var trimmedBody = body.TrimStart();
+            if (StartsWithSplitMarker(trimmedBody))
+            {
+                result.IsContinuation = true;
+                result.BodyWithoutContinuationMarker = trimmedBody.Substring(1).TrimStart();
+            }
+            else
+            {
+                result.BodyWithoutContinuationMarker = body;
+            }
+
+            return result;
+        }
+
+        private static string CleanSplitText(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return text;
+            }
+
+            text = text.Trim();
+            if (EndsWithSplitMarker(text))
+            {
+                text = text.Substring(0, text.Length - 1).TrimEnd();
+            }
+
+            return text;
+        }
+
+        private static bool StartsWithSplitMarker(string text)
+        {
+            return !string.IsNullOrEmpty(text) && text[0] == '\u00bb';
+        }
+
+        private static bool EndsWithSplitMarker(string text)
+        {
+            return !string.IsNullOrWhiteSpace(text) && text.TrimEnd().EndsWith("\u00bb", StringComparison.Ordinal);
+        }
+
+        private static void UpdateWowSplitState(string speaker, bool endedWithSplitMarker, DateTimeOffset now)
+        {
+            _lastWowSplitSpeaker = speaker;
+            _lastWowTextEndedWithSplitMarker = endedWithSplitMarker;
+            _lastWowSplitTime = now;
+        }
+
+        private static bool IsWowProcess()
+        {
+            try
+            {
+                return string.Equals(Process.GetCurrentProcess().ProcessName, "Wow", StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static int WriteStream(ISpTTSEngineSite site, Stream stream, CancellationTokenSource cancellation)
@@ -415,6 +566,15 @@ namespace ElevenLabsTtsEngine
             {
                 return new SpeechSegment { IsSilence = true, SilenceMSecs = milliseconds };
             }
+        }
+
+        private struct WowChatLine
+        {
+            public bool HasChatPrefix;
+            public bool IsContinuation;
+            public bool EndsWithSplitMarker;
+            public string Speaker;
+            public string BodyWithoutContinuationMarker;
         }
     }
 }
